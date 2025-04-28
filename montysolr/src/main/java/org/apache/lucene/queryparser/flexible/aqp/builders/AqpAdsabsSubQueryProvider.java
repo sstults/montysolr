@@ -697,9 +697,26 @@ public class AqpAdsabsSubQueryProvider implements
                 Query innerQuery = fp.parseNestedQuery();
                 SolrQueryRequest req = fp.getReq();
                 try {
-                    // XXX: not sure if i can use several fields: citationSearchIdField
-                    return JoinUtil.createJoinQuery("bibcode", false, "reference", innerQuery,
-                            req.getSearcher(), ScoreMode.Avg);
+                    // Support multiple identifier fields by creating a disjunction (OR) of joins
+                    if (citationSearchIdField.length == 1) {
+                        // Simple case - single identifier field
+                        return JoinUtil.createJoinQuery(citationSearchIdField[0], false, citationSearchRefField, innerQuery,
+                                req.getSearcher(), ScoreMode.Avg);
+                    } else {
+                        // Handle multiple identifier fields (like bibcode and alternate_bibcode)
+                        List<Query> joinQueries = new ArrayList<>();
+                        for (String idField : citationSearchIdField) {
+                            joinQueries.add(JoinUtil.createJoinQuery(idField, false, citationSearchRefField, innerQuery,
+                                    req.getSearcher(), ScoreMode.Avg));
+                        }
+                        
+                        // Combine all join queries with OR (SHOULD)
+                        BooleanQuery.Builder builder = new BooleanQuery.Builder();
+                        for (Query joinQuery : joinQueries) {
+                            builder.add(joinQuery, BooleanClause.Occur.SHOULD);
+                        }
+                        return builder.build();
+                    }
                 } catch (IOException e) {
                     throw new SyntaxError(e.getMessage());
                 }
@@ -725,8 +742,26 @@ public class AqpAdsabsSubQueryProvider implements
                 Query innerQuery = fp.parseNestedQuery();
                 SolrQueryRequest req = fp.getReq();
                 try {
-                    return JoinUtil.createJoinQuery("bibcode", false, "citation", innerQuery,
-                            req.getSearcher(), ScoreMode.Avg);
+                    // Support multiple identifier fields by creating a disjunction (OR) of joins
+                    if (citationSearchIdField.length == 1) {
+                        // Simple case - single identifier field
+                        return JoinUtil.createJoinQuery(citationSearchIdField[0], false, "citation", innerQuery,
+                                req.getSearcher(), ScoreMode.Avg);
+                    } else {
+                        // Handle multiple identifier fields (like bibcode and alternate_bibcode)
+                        List<Query> joinQueries = new ArrayList<>();
+                        for (String idField : citationSearchIdField) {
+                            joinQueries.add(JoinUtil.createJoinQuery(idField, false, "citation", innerQuery,
+                                    req.getSearcher(), ScoreMode.Avg));
+                        }
+                        
+                        // Combine all join queries with OR (SHOULD)
+                        BooleanQuery.Builder builder = new BooleanQuery.Builder();
+                        for (Query joinQuery : joinQueries) {
+                            builder.add(joinQuery, BooleanClause.Occur.SHOULD);
+                        }
+                        return builder.build();
+                    }
                 } catch (IOException e) {
                     throw new SyntaxError(e.getMessage());
                 }
