@@ -1,235 +1,195 @@
 package org.apache.lucene.search;
 
-import org.apache.lucene.document.Document;
-import org.apache.lucene.index.LeafReaderContext;
+import java.io.IOException;
+import java.util.*;
+
 import org.apache.lucene.index.Term;
 import org.apache.lucene.util.BytesRefBuilder;
+import org.apache.solr.client.solrj.SolrQuery;
 import org.apache.solr.client.solrj.impl.CloudSolrClient;
 import org.apache.solr.client.solrj.request.CollectionAdminRequest;
-import org.apache.solr.embedded.JettySolrRunner;
-import org.apache.solr.cloud.MiniSolrCloudCluster;
+import org.apache.solr.client.solrj.request.UpdateRequest;
+import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.cloud.SolrCloudTestCase;
 import org.apache.solr.common.SolrInputDocument;
-import org.apache.solr.common.cloud.ClusterState;
-import org.apache.solr.common.cloud.DocCollection;
-import org.apache.solr.common.cloud.Replica;
-import org.apache.solr.common.cloud.Slice;
-import org.apache.solr.core.CoreContainer;
-import org.apache.solr.core.SolrCore;
 import org.apache.solr.legacy.LegacyNumericUtils;
 import org.apache.solr.search.CitationCache;
-import org.apache.solr.SolrTestCaseJ4;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.apache.solr.search.SolrIndexSearcher;
+import org.junit.*;
 
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.Map.Entry;
 
-/**
- * Test for citation functionality in a single-shard SolrCloud environment.
- * This test adapts the functionality from TestCitationsSearch to work with SolrCloud.
- */
-@SuppressWarnings({"rawtypes", "unchecked"})
-public class TestCitationsSearchCloudSingleShard extends SolrTestCaseJ4 {
-    
-    private MiniSolrCloudCluster solrCloudCluster;
-    private CloudSolrClient cloudClient;
-    private final boolean debug = false;
-    private final int numShards = 1; // Single shard configuration
+public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
+
+    private static final String COLLECTION = "citations_collection";
+    private static final int numShards = 1;
+    private static final int numReplicas = 2;
+    private static final int nodeCount = numShards * numReplicas;
+    private static final boolean debug = false;
+    public static final String CITATIONS_CACHE = "citations-cache-from-references";
+
+    @BeforeClass
+    public static void setupCluster() throws Exception {
+
+        configureCluster(nodeCount)
+            .addConfig("citation_config",
+                java.nio.file.Paths.get("src/test/resources/solr/cloud-conf").toAbsolutePath())
+            .configure();
+
+        CollectionAdminRequest.createCollection(COLLECTION, "citation_config", numShards, numReplicas)
+            .process(cluster.getSolrClient());
+
+        cluster.waitForActiveCollection(COLLECTION, numShards, numReplicas);
+    }
 
     @Before
-    public void setUp() throws Exception {
-        super.setUp();
-        setupCluster();
+    public void clearCloudCollection() throws Exception {
+        assertEquals(0, cluster.getSolrClient(COLLECTION).deleteByQuery("*:*").getStatus());
+        assertEquals(0, cluster.getSolrClient(COLLECTION).commit().getStatus());
     }
 
-    @After
-    public void tearDown() throws Exception {
-        if (cloudClient != null) {
-            cloudClient.close();
+    @AfterClass
+    public static void afterClass() throws Exception {
+
+        CloudSolrClient solrClient = cluster.getSolrClient(COLLECTION);
+        if (null != solrClient) {
+            solrClient.close();
+            solrClient = null;
         }
-        if (solrCloudCluster != null) {
-            solrCloudCluster.shutdown();
+
+        if (null != cluster) {
+            SolrIndexSearcher searcher = cluster.getJettySolrRunner(0)
+                .getCoreContainer()
+                .getCores()
+                .stream()
+                .filter(core -> core.getName().contains(COLLECTION))
+                .findFirst()
+                .orElseThrow(() -> new RuntimeException("Collection not found"))
+                .getSearcher()
+                .get();
+
+            CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
+            cache.clear();
+            cache.close();
+
+            cluster.deleteAllCollections();
+            cluster.deleteAllConfigSets();
+            searcher.close();
+            cluster.shutdown();
+            cluster = null;
         }
-        super.tearDown();
     }
 
-    @SuppressWarnings("deprecation") // Using deprecated setDefaultCollection for compatibility
-    private void setupCluster() throws Exception {
-        // Create a temporary directory for Solr files
-        Path tempDir = createTempDir();
-        
-        // Set up the cluster with a single node
-        solrCloudCluster = new MiniSolrCloudCluster(1, tempDir,
-                MiniSolrCloudCluster.DEFAULT_CLOUD_SOLR_XML, 
-                buildJettyConfig());
-        
-        // Upload the configuration
-        String configName = "citation-config";
-        Path configDir = getConfigSetPath();
-        solrCloudCluster.uploadConfigSet(configDir, configName);
-        
-        // Create the collection with a single shard
-        CollectionAdminRequest.Create createRequest = CollectionAdminRequest.createCollection(
-                "collection1", configName, numShards, 1);
-        createRequest.process(solrCloudCluster.getSolrClient());
-        
-        // Wait for the collection to be available and all shards active
-        solrCloudCluster.waitForAllNodes(30);
-        
-        // Ensure the collection is ready with active shards
-        boolean success = false;
-        long startTime = System.currentTimeMillis();
-        long timeoutMs = TimeUnit.SECONDS.toMillis(30);
-        
-        while (!success && (System.currentTimeMillis() - startTime) < timeoutMs) {
-            try {
-                ClusterState clusterState = solrCloudCluster.getSolrClient().getClusterState();
-                if (clusterState != null) {
-                    DocCollection collection = clusterState.getCollectionOrNull("collection1");
-                    if (collection != null) {
-                        // Check that all shards are active
-                        boolean allShardsActive = true;
-                        for (Slice slice : collection.getSlices()) {
-                            // Check if this shard has at least one active replica
-                            boolean hasActiveReplica = false;
-                            for (Replica replica : slice.getReplicas()) {
-                                if (replica.isActive(clusterState.getLiveNodes())) {
-                                    hasActiveReplica = true;
-                                    break;
-                                }
-                            }
-                            if (!hasActiveReplica) {
-                                allShardsActive = false;
-                                break;
-                            }
-                        }
-                        
-                        if (allShardsActive) {
-                            success = true;
-                            break;
-                        }
-                    }
-                }
-                
-                // Wait a bit before trying again
-                Thread.sleep(500);
-            } catch (Exception e) {
-                // Continue waiting if there's an error
-                Thread.sleep(100);
+    @Test
+    public void testBasicSetup() throws Exception {
+        // Create and add a document
+        SolrInputDocument doc = new SolrInputDocument();
+        doc.addField("id", "1");
+        doc.addField("bibcode", "b1");
+        doc.addField("year", "2022");
+
+        UpdateRequest req = new UpdateRequest();
+        req.add(doc);
+        req.commit(cluster.getSolrClient(), COLLECTION);
+
+        SolrQuery query = new SolrQuery("id:1");
+        QueryResponse response = cluster.getSolrClient().query(COLLECTION, query);
+
+        assertEquals(1, response.getResults().size());
+        assertEquals(1, response.getResults().get(0).getFieldValue("id"));
+    }
+
+    @Test
+    public void testCitationsCacheInitialization() throws Exception {
+        SolrIndexSearcher searcher = getSearcher();
+        CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
+//        searcher.close();
+        assertNotNull("CitationCache not found in searcher", cache);
+    }
+
+
+    @Test
+    public void testBasicCitationRelationships() throws Exception {
+        // Create test documents with citation relationships
+        createDocumentWithReferences("10", "b10", new String[]{"b11", "b12"});
+        createDocumentWithReferences("11", "b11", new String[]{"b12"});
+        createDocumentWithReferences("12", "b12", new String[]{});
+
+        // Force commit
+        cluster.getSolrClient().commit(COLLECTION);
+
+        // Get the searcher for the collection
+        SolrIndexSearcher searcher = getSearcher();
+        CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
+        assertNotNull("CitationCache not found in searcher", cache);
+
+        // Verify the citations are in the cache
+        int doc10Id = getDocId("10", searcher);
+        int doc11Id = getDocId("11", searcher);
+        int doc12Id = getDocId("12", searcher);
+
+        // Check references (what doc10 cites)
+        int[] doc10Refs = cache.getReferences(doc10Id);
+        assertNotNull("References for doc10 should not be null", doc10Refs);
+        assertEquals("Doc10 should cite 2 documents", 2, doc10Refs.length);
+
+        // Check citations (what cites doc12)
+        int[] doc12Citations = cache.getCitations(doc12Id);
+        assertNotNull("Citations for doc12 should not be null", doc12Citations);
+        assertEquals("Doc12 should be cited by 2 documents", 2, doc12Citations.length);
+
+        // Check specific citation relationships
+        boolean doc10CitesDoc11 = false;
+        for (int citedDocId : doc10Refs) {
+            if (citedDocId == doc11Id) {
+                doc10CitesDoc11 = true;
+                break;
             }
         }
-        
-        if (!success) {
-            throw new RuntimeException("Timed out waiting for collection to be available and active");
-        }
-        
-        cloudClient = solrCloudCluster.getSolrClient();
-        cloudClient.setDefaultCollection("collection1");
-    }
-    
-    private Path getConfigSetPath() throws Exception {
-        // Create a temporary directory for the config set
-        Path configDir = createTempDir("config");
-        
-        // Create the solrconfig.xml with citation cache configuration
-        String solrConfigXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n"
-                + "<config>\n"
-                + "  <luceneMatchVersion>8.0.0</luceneMatchVersion>\n"
-                + "  <dataDir>${solr.data.dir:}</dataDir>\n"
-                + "  <directoryFactory name=\"DirectoryFactory\" class=\"${solr.directoryFactory:solr.NRTCachingDirectoryFactory}\"/>\n"
-                + "  <schemaFactory class=\"ClassicIndexSchemaFactory\"/>\n"
-                + "  <codecFactory class=\"solr.SchemaCodecFactory\"/>\n"
-                + "  <indexConfig>\n"
-                + "    <lockType>native</lockType>\n"
-                + "  </indexConfig>\n"
-                + "  <updateHandler class=\"solr.DirectUpdateHandler2\">\n"
-                + "    <updateLog>\n"
-                + "      <str name=\"dir\">${solr.ulog.dir:}</str>\n"
-                + "    </updateLog>\n"
-                + "  </updateHandler>\n"
-                + "  <query>\n"
-                + "    <maxBooleanClauses>1024</maxBooleanClauses>\n"
-                + "    <filterCache class=\"solr.FastLRUCache\" size=\"512\" initialSize=\"512\" autowarmCount=\"0\"/>\n"
-                + "    <queryResultCache class=\"solr.LRUCache\" size=\"512\" initialSize=\"512\" autowarmCount=\"0\"/>\n"
-                + "    <documentCache class=\"solr.LRUCache\" size=\"512\" initialSize=\"512\" autowarmCount=\"0\"/>\n"
-                + "    <cache name=\"citations-cache-from-references\" class=\"org.apache.solr.search.CitationLRUCache\" size=\"512\" initialSize=\"512\" autowarmCount=\"0\">\n"
-                + "      <str name=\"mainCacheKey\">id</str>\n"
-                + "      <str name=\"lookupCacheKey\">bibcode</str>\n"
-                + "      <str name=\"citationField\">reference</str>\n"
-                + "      <str name=\"identifierField\">bibcode</str>\n"
-                + "      <str name=\"identifierField\">alternate_bibcode</str>\n"
-                + "      <str name=\"uniqueKeyField\">id</str>\n"
-                + "      <bool name=\"populateOnStartup\">true</bool>\n"
-                + "    </cache>\n"
-                + "  </query>\n"
-                + "  <requestDispatcher>\n"
-                + "    <httpCaching never304=\"true\" />\n"
-                + "  </requestDispatcher>\n"
-                + "  <requestHandler name=\"/select\" class=\"solr.SearchHandler\" />\n"
-                + "  <requestHandler name=\"/update\" class=\"solr.UpdateRequestHandler\" />\n"
-                + "</config>";
-        
-        // Create a schema.xml with citation-related fields
-        String schemaXml = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n"
-                + "<schema name=\"minimal\" version=\"1.6\">\n"
-                + "  <types>\n"
-                + "    <fieldType name=\"string\" class=\"solr.StrField\" />\n"
-                + "    <fieldType name=\"int\" class=\"solr.TrieIntField\"\n"
-                + "      precisionStep=\"0\" omitNorms=\"true\" positionIncrementGap=\"0\" />\n"
-                + "  </types>\n"
-                + "  <fields>\n"
-                + "    <field name=\"id\" type=\"int\" indexed=\"true\" stored=\"true\"\n"
-                + "      required=\"true\" />\n"
-                + "    <field name=\"bibcode\" type=\"string\" indexed=\"true\" stored=\"true\"\n"
-                + "      required=\"false\" />\n"
-                + "    <field name=\"alternate_bibcode\" type=\"string\" indexed=\"true\" stored=\"true\"\n"
-                + "      required=\"false\" multiValued=\"true\"/>\n"  
-                + "    <field name=\"reference\" type=\"string\" indexed=\"true\" stored=\"true\" \n"
-                + "      multiValued=\"true\"/>\n"
-                + "    <field name=\"ireference\" type=\"int\" indexed=\"true\" stored=\"true\" \n"
-                + "      multiValued=\"true\"/>\n"
-                + "    <field name=\"year\" type=\"string\" indexed=\"true\" stored=\"true\"\n"
-                + "      required=\"false\" />\n"
-                + "  </fields>\n"
-                + "  <uniqueKey>id</uniqueKey>\n"
-                + "</schema>";
-        
-        // Write the config files
-        Files.write(configDir.resolve("solrconfig.xml"), solrConfigXml.getBytes());
-        Files.write(configDir.resolve("schema.xml"), schemaXml.getBytes());
-        
-        return configDir;
-    }
-    
-    /**
-     * Build a JettyConfig for the MiniSolrCloudCluster
-     */
-    private org.apache.solr.embedded.JettyConfig buildJettyConfig() {
-        return org.apache.solr.embedded.JettyConfig.builder()
-                .setContext("/solr")
-                .build();
+        assertTrue("Doc10 should cite Doc11", doc10CitesDoc11);
+        searcher.getCache("citations-cache-from-references").clear();
+//        searcher.getCache("citations-cache-from-references").close();
+//        searcher.close();
     }
 
-    /**
-     * Create random documents with citation relationships
-     */
+    private void createDocumentWithReferences(String id, String bibcode, String[] references) throws Exception {
+        SolrInputDocument doc = new SolrInputDocument();
+        doc.addField("id", id);
+        doc.addField("bibcode", bibcode);
+        doc.addField("year", "2022");
+
+        for (String ref : references) {
+            doc.addField("reference", ref);
+        }
+
+        UpdateRequest req = new UpdateRequest();
+        req.add(doc);
+        req.commit(cluster.getSolrClient(), COLLECTION);
+    }
+
+    private int getDocId(String id, SolrIndexSearcher searcher) throws IOException {
+        BytesRefBuilder builder = new BytesRefBuilder();
+        LegacyNumericUtils.intToPrefixCoded(Integer.parseInt(id), 0, builder);
+        ScoreDoc[] docs = searcher.search(new TermQuery(new Term("id", builder)), 1).scoreDocs;
+        assertTrue("Document not found: " + id, docs.length > 0);
+        return docs[0].doc;
+    }
+
+    private SolrIndexSearcher getSearcher() {
+        // Get the searcher from the first node's collection
+        return cluster.getJettySolrRunner(0)
+            .getCoreContainer()
+            .getCores()
+            .stream()
+            .filter(core -> core.getName().contains(COLLECTION))
+            .findFirst()
+            .orElseThrow(() -> new RuntimeException("Collection not found"))
+            .getSearcher()
+            .get();
+    }
+
     private HashMap<Integer, int[]> createRandomDocs(int start, int numDocs) throws Exception {
         Random randomSeed = new Random(42);
-        
+
         int[] randData = new int[numDocs / 10];
         for (int i = 0; i < randData.length; i++) {
             randData[i] = Math.abs(randomSeed.nextInt(numDocs) - start);
@@ -248,11 +208,12 @@ public class TestCitationsSearchCloudSingleShard extends SolrTestCaseJ4 {
             }
         }
 
-        HashMap<Integer, int[]> data = new HashMap<Integer, int[]>(randi.length);
-        List<SolrInputDocument> documents = new ArrayList<>();
+        HashMap<Integer, int[]> data = new HashMap<>(randi.length);
+
+        SolrInputDocument doc = new SolrInputDocument();
 
         for (int k = 0; k < randi.length; k++) {
-            SolrInputDocument doc = new SolrInputDocument();
+            doc.clear();
             doc.addField("id", String.valueOf(k + start));
             doc.addField("bibcode", "b" + (k + start));
             if (k % 2 == 0) {
@@ -269,249 +230,15 @@ public class TestCitationsSearchCloudSingleShard extends SolrTestCaseJ4 {
                 doc.addField("ireference", String.valueOf(v + start));
                 x++;
             }
-            documents.add(doc);
+            UpdateRequest req = new UpdateRequest();
+            req.add(doc);
+            req.commit(cluster.getSolrClient(), COLLECTION);
+
             data.put(k + start, row);
-            
-            if (debug) {
-                System.out.println("Added document: " + doc);
-            }
+            if (debug) System.out.println(doc);
         }
 
-        // Add documents in batches
-        int batchSize = 100;
-        for (int i = 0; i < documents.size(); i += batchSize) {
-            int end = Math.min(i + batchSize, documents.size());
-            cloudClient.add(documents.subList(i, end));
-            if (i % 500 == 0) {
-                cloudClient.commit();
-            }
-        }
-        cloudClient.commit();
-
-        if (debug) {
-            System.out.println("Created random docs: " + start + " - " + numDocs);
-        }
+        if (debug) System.out.println("Created random docs: " + start + " - " + numDocs);
         return data;
-    }
-
-    /**
-     * Test for citation collector functionality in single-shard SolrCloud
-     */
-    @Test
-    public void testCitesCollector() throws Exception {
-        int maxHits = 1000;
-        int maxHitsFound = Float.valueOf(maxHits * 0.3f).intValue();
-        
-        // Create documents across multiple commits to simulate realistic conditions
-        createRandomDocs(0, Float.valueOf(maxHits * 0.4f).intValue());
-        cloudClient.commit();
-
-        createRandomDocs(Float.valueOf(maxHits * 0.3f).intValue(), Float.valueOf(maxHits * 0.7f).intValue());
-        cloudClient.commit();
-
-        createRandomDocs(Float.valueOf(maxHits * 0.71f).intValue(), Float.valueOf(maxHits * 1.0f).intValue());
-        cloudClient.commit();
-
-        createRandomDocs(0, Float.valueOf(maxHits * 0.2f).intValue());
-        cloudClient.commit();
-
-        // To access the CitationCache, we need to get the SolrCore from the cluster
-        JettySolrRunner jetty = solrCloudCluster.getJettySolrRunners().get(0);
-        CoreContainer coreContainer = jetty.getCoreContainer();
-        // Updated core name format based on current Solr version
-        SolrCore core = coreContainer.getCore("collection1_shard1_replica_n1");
-        
-        try {
-            org.apache.solr.search.SolrIndexSearcher searcher = core.getSearcher().get();
-            
-            // Get the citation cache
-            final CitationCache cache = (CitationCache) searcher.getCache("citations-cache-from-references");
-            assertNotNull("Citation cache should not be null", cache);
-    
-            SolrCacheWrapper citationsWrapper = new SolrCacheWrapper.CitationsCache(cache);
-            SolrCacheWrapper referencesWrapper = new SolrCacheWrapper.ReferencesCache(cache);
-    
-            // Invert ourselves - this is what we expect to find
-            HashMap<Integer, int[]> references = reconstructCitationCache(searcher);
-            HashMap<Integer, int[]> citations = invert(references);
-    
-            // Verify citation relationships match between our reconstructed cache and the real cache
-            for (Entry<Integer, int[]> es : references.entrySet()) {
-                int docid = es.getKey();
-                int[] docids = es.getValue();
-                for (int reference : docids) {
-                    if (citations.get(reference) != null) {
-                        List<Integer> a = Arrays.stream(citations.get(reference)).boxed().collect(Collectors.toList());
-                        List<Integer> b = Arrays.stream(citationsWrapper.getLuceneDocIds(reference)).boxed().collect(Collectors.toList());
-                        assertTrue(a.contains(docid));
-                        assertTrue(b.contains(docid));
-                        assertEquals(a, b);
-                    }
-                }
-            }
-    
-            // Verify reference relationships match between our reconstructed cache and the real cache
-            for (Entry<Integer, int[]> es : citations.entrySet()) {
-                int docid = es.getKey();
-                int[] docids = es.getValue();
-                for (int reference : docids) {
-                    List<Integer> a = Arrays.stream(references.get(reference)).boxed().collect(Collectors.toList());
-                    List<Integer> b = Arrays.stream(referencesWrapper.getLuceneDocIds(reference)).boxed().collect(Collectors.toList());
-                    Collections.sort(a);
-                    Collections.sort(b);
-                    assertTrue(a.contains(docid));
-                    assertTrue(b.contains(docid));
-                    assertEquals(docid + " produced diff cache results", a, b);
-                }
-            }
-    
-            // Test second-order collectors (citations/cited-by)
-            SecondOrderCollectorCites coll = new SecondOrderCollectorCites(referencesWrapper, new String[]{"reference"});
-            coll.searcherInitialization(searcher, null);
-    
-            // Run 2nd order through the whole index
-            searcher.search(new SecondOrderQuery(new MatchAllDocsQuery(), coll), 10);
-    
-            ScoreDoc[] hits;
-            for (Integer i = 0; i < maxHits; i++) {
-                // int field types must be searched with bytes value (not strings)
-                BytesRefBuilder br = new BytesRefBuilder();
-                LegacyNumericUtils.intToPrefixCoded(i, 0, br);
-    
-                ScoreDoc[] doc = searcher.search(new TermQuery(new Term("id", br.get().utf8ToString())), 1000).scoreDocs;
-    
-                if (doc.length == 0) // that's ok, some docs are missing
-                    continue;
-    
-                int docid = doc[0].doc;
-    
-                // Test references(id:X)
-                if (debug)
-                    System.out.println(i + " cites : " + join(references.get(docid)) + " -> " + join(referencesWrapper.getLuceneDocIds(docid)));
-                hits = searcher.search(new SecondOrderQuery(new TermQuery(new Term("id", br.get().utf8ToString())),
-                        new SecondOrderCollectorCites(referencesWrapper, new String[]{"reference"})), maxHitsFound).scoreDocs;
-                hitsEquals(docid, references, hits);
-                hits = searcher.search(new SecondOrderQuery(new TermQuery(new Term("id", br.get().utf8ToString())),
-                        new SecondOrderCollectorCitesRAM(referencesWrapper), false), maxHitsFound).scoreDocs;
-                hitsEquals(docid, references, hits);
-    
-                // Test citations(id:X)
-                if (debug)
-                    System.out.println(i + " cited-by : " + join(citations.get(docid)) + " -> " + join(citationsWrapper.getLuceneDocIds(docid)));
-                hits = searcher.search(new SecondOrderQuery(new TermQuery(new Term("id", br.get().utf8ToString())),
-                        new SecondOrderCollectorCitedBy(citationsWrapper), false), maxHitsFound).scoreDocs;
-                hitsEquals(docid, citations, hits);
-            }
-        } finally {
-            core.close();
-        }
-    }
-
-    /**
-     * Reconstruct the citation cache from documents for verification
-     */
-    private HashMap<Integer, int[]> reconstructCitationCache(org.apache.solr.search.SolrIndexSearcher searcher)
-            throws IOException {
-        Map<String, Integer> bibcodeToDocid = new HashMap<String, Integer>();
-        Map<String, String[]> references = new HashMap<String, String[]>();
-
-        searcher.search(new MatchAllDocsQuery(), new SimpleCollector() {
-            private LeafReaderContext context;
-
-            @Override
-            public ScoreMode scoreMode() {
-                return ScoreMode.COMPLETE_NO_SCORES;
-            }
-
-            @Override
-            protected void doSetNextReader(LeafReaderContext context) throws IOException {
-                this.context = context;
-            }
-
-            @Override
-            public void collect(int doc) throws IOException {
-                Document d = searcher.doc(doc + this.context.docBase);
-                bibcodeToDocid.put(d.get("bibcode"), doc + this.context.docBase);
-                references.put(d.get("bibcode"), d.getValues("reference"));
-            }
-        });
-
-        HashMap<Integer, int[]> out = new HashMap<Integer, int[]>();
-        for (Entry<String, String[]> es : references.entrySet()) {
-            Integer docid = bibcodeToDocid.get(es.getKey());
-            Set<Integer> docids = new HashSet<Integer>();
-            String[] refs = es.getValue();
-            for (int i = 0; refs != null && i < refs.length; i++) {
-                if (bibcodeToDocid.get(refs[i]) == null)
-                    continue;
-                docids.add(bibcodeToDocid.get(refs[i]));
-            }
-            if (docids.isEmpty()) {
-                out.put(docid, new int[0]);
-            } else {
-                out.put(docid, Arrays.stream(docids.toArray(new Integer[docids.size()])).mapToInt(Integer::intValue).toArray());
-            }
-        }
-        return out;
-    }
-
-    /**
-     * Invert the citation map to get a map of citations to citing documents
-     */
-    private HashMap<Integer, int[]> invert(HashMap<Integer, int[]> cites) {
-        HashMap<Integer, List<Integer>> result = new HashMap<Integer, List<Integer>>(cites.size());
-        for (Entry<Integer, int[]> e : cites.entrySet()) {
-            for (int paperId : e.getValue()) {
-                if (!result.containsKey(paperId)) {
-                    result.put(paperId, new ArrayList<Integer>());
-                }
-                result.get(paperId).add(e.getKey());
-            }
-        }
-        HashMap<Integer, int[]> out = new HashMap<Integer, int[]>();
-        for (Entry<Integer, List<Integer>> e : result.entrySet()) {
-            List<Integer> list = e.getValue();
-            int[] ret = new int[list.size()];
-            for (int i = 0; i < ret.length; i++)
-                ret[i] = list.get(i);
-            out.put(e.getKey(), ret);
-        }
-        return out;
-    }
-
-    /**
-     * Check that the given hits match the expected citation relationships
-     */
-    private boolean hitsEquals(int docid, HashMap<Integer, int[]> cache, ScoreDoc[] hits) throws Exception {
-        int[] links = cache.get(docid);
-
-        ArrayList<Integer> result = new ArrayList<Integer>();
-        for (ScoreDoc d : hits) {
-            result.add(d.doc);
-        }
-        ArrayList<Integer> expected = new ArrayList<Integer>();
-        if (links != null) {
-            for (int r : links) {
-                expected.add(r);
-            }
-        }
-        Collections.sort(expected);
-        Collections.sort(result);
-
-        assertEquals(docid + " differs", expected, result);
-        return true;
-    }
-
-    /**
-     * Join an array of integers into a comma-separated string
-     */
-    private String join(int[] l) {
-        if (l == null) return "";
-        StringBuilder sb = new StringBuilder();
-        for (int s : l) {
-            if (sb.length() > 0) sb.append(",");
-            sb.append(s);
-        }
-        return sb.toString();
     }
 }

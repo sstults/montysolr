@@ -32,8 +32,15 @@ dependencies {
 
 	testImplementation("junit:junit:4.13.2")
 	testImplementation("org.antlr:stringtemplate:3.2.1")
-	testImplementation("org.apache.solr:solr-test-framework:9.6.1")
+	testImplementation("org.apache.solr:solr-test-framework:9.6.1") {
+		isTransitive = true
+	}
 	testImplementation("org.apache.solr:solr-scripting:9.6.1")
+	// Add explicit jetty dependencies
+	testImplementation("org.eclipse.jetty:jetty-server:10.0.20")
+	testImplementation("org.eclipse.jetty:jetty-servlet:10.0.20")
+	testImplementation("org.apache.solr:solr-solrj:9.6.1")
+	testImplementation("org.apache.solr:solr-core:9.6.1")
 	testImplementation("org.apache.lucene:lucene-test-framework:9.10.0")
 	testImplementation("org.apache.lucene:lucene-backward-codecs:9.10.0")
 	testImplementation("org.apache.lucene:lucene-codecs:9.10.0")

@@ -26,6 +26,8 @@ import org.apache.solr.common.SolrException;
 import org.apache.solr.common.SolrException.ErrorCode;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.util.SimpleOrderedMap;
+import org.apache.solr.core.CoreContainer;
+import org.apache.solr.core.SolrResourceLoader;
 import org.apache.solr.metrics.SolrMetricsContext;
 import org.apache.solr.schema.*;
 import org.apache.solr.uninverting.UninvertingReader;
@@ -409,17 +411,36 @@ public class CitationLRUCache<K, V> extends SolrCacheBase implements CitationCac
     }
 
     private File getCacheStorageDir(SolrIndexSearcher searcher) {
-        File f = new File(searcher.getCore().getResourceLoader().getConfigDir());
-        try {
-            assert f.exists();
-            assert f.isDirectory();
-            assert f.canWrite();
-        } catch (AssertionError ae) {
-            return null;
-        } catch (Exception e) {
+//        File f = new File(searcher.getCore().getResourceLoader().getConfigDir());
+//        try {
+//            assert f.exists();
+//            assert f.isDirectory();
+//            assert f.canWrite();
+//        } catch (AssertionError ae) {
+//            return null;
+//        } catch (Exception e) {
+//            return null;
+//        }
+//        return f;
+
+        CoreContainer container = searcher.getCore().getCoreContainer();
+        boolean isCloud = container.isZooKeeperAware();
+
+        SolrResourceLoader loader = searcher.getCore().getResourceLoader();
+        File directory;
+
+        if (isCloud) {
+            directory = loader.getInstancePath().toFile();
+        } else {
+            // Use the config directory in standalone mode
+            directory = loader.getConfigPath().getParent().toFile();
+        }
+
+        if (!directory.exists() || !directory.isDirectory() || !directory.canWrite()) {
             return null;
         }
-        return f;
+
+        return directory;
     }
 
     private CitationCacheReaderWriter getCitationCacheReaderWriter(SolrIndexSearcher searcher) {
