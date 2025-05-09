@@ -44,7 +44,7 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
         CollectionAdminRequest.createCollection(COLLECTION, "citation_config", numShards, numReplicas)
                 .process(cluster.getSolrClient());
 
-        cluster.waitForActiveCollection(COLLECTION, numShards, numReplicas);
+        cluster.waitForActiveCollection(COLLECTION, numShards, numShards * numReplicas);
         solrClient = cluster.getSolrClient(COLLECTION);
     }
 

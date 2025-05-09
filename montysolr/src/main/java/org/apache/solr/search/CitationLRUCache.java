@@ -411,36 +411,18 @@ public class CitationLRUCache<K, V> extends SolrCacheBase implements CitationCac
     }
 
     private File getCacheStorageDir(SolrIndexSearcher searcher) {
-//        File f = new File(searcher.getCore().getResourceLoader().getConfigDir());
-//        try {
-//            assert f.exists();
-//            assert f.isDirectory();
-//            assert f.canWrite();
-//        } catch (AssertionError ae) {
-//            return null;
-//        } catch (Exception e) {
-//            return null;
-//        }
-//        return f;
-
-        CoreContainer container = searcher.getCore().getCoreContainer();
-        boolean isCloud = container.isZooKeeperAware();
-
-        SolrResourceLoader loader = searcher.getCore().getResourceLoader();
-        File directory;
-
-        if (isCloud) {
-            directory = loader.getInstancePath().toFile();
-        } else {
-            // Use the config directory in standalone mode
-            directory = loader.getConfigPath().getParent().toFile();
-        }
-
-        if (!directory.exists() || !directory.isDirectory() || !directory.canWrite()) {
+        File f = searcher.getCore().getResourceLoader().getConfigPath().toFile();
+        try {
+            assert f.exists();
+            assert f.isDirectory();
+            assert f.canWrite();
+        } catch (AssertionError ae) {
+            return null;
+        } catch (Exception e) {
             return null;
         }
 
-        return directory;
+        return f;
     }
 
     private CitationCacheReaderWriter getCitationCacheReaderWriter(SolrIndexSearcher searcher) {
