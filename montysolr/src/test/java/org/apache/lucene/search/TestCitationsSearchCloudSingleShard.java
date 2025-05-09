@@ -2,6 +2,7 @@ package org.apache.lucene.search;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.stream.Collectors;
 
 import org.apache.lucene.index.Term;
 import org.apache.lucene.util.BytesRefBuilder;
@@ -15,7 +16,10 @@ import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.legacy.LegacyNumericUtils;
 import org.apache.solr.search.CitationCache;
 import org.apache.solr.search.SolrIndexSearcher;
+import org.apache.solr.util.RefCounted;
 import org.junit.*;
+
+import static org.hamcrest.CoreMatchers.hasItem;
 
 
 public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
@@ -27,6 +31,8 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
     private static final boolean debug = false;
     public static final String CITATIONS_CACHE = "citations-cache-from-references";
 
+    private static CloudSolrClient solrClient = null;
+
     @BeforeClass
     public static void setupCluster() throws Exception {
 
@@ -36,47 +42,27 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
             .configure();
 
         CollectionAdminRequest.createCollection(COLLECTION, "citation_config", numShards, numReplicas)
-            .process(cluster.getSolrClient());
+                .process(cluster.getSolrClient());
 
         cluster.waitForActiveCollection(COLLECTION, numShards, numReplicas);
+        solrClient = cluster.getSolrClient(COLLECTION);
     }
 
     @Before
     public void clearCloudCollection() throws Exception {
-        assertEquals(0, cluster.getSolrClient(COLLECTION).deleteByQuery("*:*").getStatus());
-        assertEquals(0, cluster.getSolrClient(COLLECTION).commit().getStatus());
+        assertEquals(0, solrClient.deleteByQuery("*:*").getStatus());
+        assertEquals(0, solrClient.commit().getStatus());
     }
 
     @AfterClass
     public static void afterClass() throws Exception {
+        solrClient.close();
+        solrClient = null;
 
-        CloudSolrClient solrClient = cluster.getSolrClient(COLLECTION);
-        if (null != solrClient) {
-            solrClient.close();
-            solrClient = null;
-        }
-
-        if (null != cluster) {
-            SolrIndexSearcher searcher = cluster.getJettySolrRunner(0)
-                .getCoreContainer()
-                .getCores()
-                .stream()
-                .filter(core -> core.getName().contains(COLLECTION))
-                .findFirst()
-                .orElseThrow(() -> new RuntimeException("Collection not found"))
-                .getSearcher()
-                .get();
-
-            CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
-            cache.clear();
-            cache.close();
-
-            cluster.deleteAllCollections();
-            cluster.deleteAllConfigSets();
-            searcher.close();
-            cluster.shutdown();
-            cluster = null;
-        }
+        cluster.deleteAllCollections();
+        cluster.deleteAllConfigSets();
+        cluster.shutdown();
+        cluster = null;
     }
 
     @Test
@@ -100,12 +86,14 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
 
     @Test
     public void testCitationsCacheInitialization() throws Exception {
-        SolrIndexSearcher searcher = getSearcher();
-        CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
-//        searcher.close();
-        assertNotNull("CitationCache not found in searcher", cache);
+        RefCounted<SolrIndexSearcher> searcher = getSearcherForFirstCore();
+        try {
+            CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.get().getCache(CITATIONS_CACHE);
+            assertNotNull("CitationCache not found in searcher", cache);
+        } finally {
+            searcher.decref();
+        }
     }
-
 
     @Test
     public void testBasicCitationRelationships() throws Exception {
@@ -117,38 +105,39 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
         // Force commit
         cluster.getSolrClient().commit(COLLECTION);
 
-        // Get the searcher for the collection
-        SolrIndexSearcher searcher = getSearcher();
-        CitationCache<Object, Integer> cache = (CitationCache<Object, Integer>) searcher.getCache(CITATIONS_CACHE);
-        assertNotNull("CitationCache not found in searcher", cache);
+        CitationCache<Object, Integer> cache = null;
+        RefCounted<SolrIndexSearcher> searcher = getSearcherForFirstCore();
 
-        // Verify the citations are in the cache
-        int doc10Id = getDocId("10", searcher);
-        int doc11Id = getDocId("11", searcher);
-        int doc12Id = getDocId("12", searcher);
+        try {
+            cache = (CitationCache<Object, Integer>) searcher.get().getCache(CITATIONS_CACHE);
+            assertNotNull("CitationCache not found in searcher", cache);
 
-        // Check references (what doc10 cites)
-        int[] doc10Refs = cache.getReferences(doc10Id);
-        assertNotNull("References for doc10 should not be null", doc10Refs);
-        assertEquals("Doc10 should cite 2 documents", 2, doc10Refs.length);
+            // Verify the citations are in the cache
+            int doc10Id = getDocId("10", searcher.get());
+            int doc11Id = getDocId("11", searcher.get());
+            int doc12Id = getDocId("12", searcher.get());
 
-        // Check citations (what cites doc12)
-        int[] doc12Citations = cache.getCitations(doc12Id);
-        assertNotNull("Citations for doc12 should not be null", doc12Citations);
-        assertEquals("Doc12 should be cited by 2 documents", 2, doc12Citations.length);
+            // Check references (what doc10 cites)
+            int[] doc10Refs = cache.getReferences(doc10Id);
+            assertNotNull("References for doc10 should not be null", doc10Refs);
+            assertEquals("Doc10 should cite 2 documents", 2, doc10Refs.length);
 
-        // Check specific citation relationships
-        boolean doc10CitesDoc11 = false;
-        for (int citedDocId : doc10Refs) {
-            if (citedDocId == doc11Id) {
-                doc10CitesDoc11 = true;
-                break;
+            // Check citations (what cites doc12)
+            int[] doc12Citations = cache.getCitations(doc12Id);
+            assertNotNull("Citations for doc12 should not be null", doc12Citations);
+            assertEquals("Doc12 should be cited by 2 documents", 2, doc12Citations.length);
+
+            // Check specific citation relationships
+            assertThat(Arrays.stream(doc10Refs).boxed().collect(Collectors.toList()), hasItem(doc11Id));
+            assertThat(Arrays.stream(doc10Refs).boxed().collect(Collectors.toList()), hasItem(doc12Id));
+            assertThat(Arrays.stream(doc12Citations).boxed().collect(Collectors.toList()), hasItem(doc10Id));
+            assertThat(Arrays.stream(doc12Citations).boxed().collect(Collectors.toList()), hasItem(doc11Id));
+        } finally {
+            if (cache != null) {
+                cache.clear();
             }
+            searcher.decref();
         }
-        assertTrue("Doc10 should cite Doc11", doc10CitesDoc11);
-        searcher.getCache("citations-cache-from-references").clear();
-//        searcher.getCache("citations-cache-from-references").close();
-//        searcher.close();
     }
 
     private void createDocumentWithReferences(String id, String bibcode, String[] references) throws Exception {
@@ -174,8 +163,8 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
         return docs[0].doc;
     }
 
-    private SolrIndexSearcher getSearcher() {
-        // Get the searcher from the first node's collection
+    private static RefCounted<SolrIndexSearcher> getSearcherForFirstCore() {
+        // Get the searcher for the (first) core from the first node's collection, always return a new instance
         return cluster.getJettySolrRunner(0)
             .getCoreContainer()
             .getCores()
@@ -183,8 +172,7 @@ public class TestCitationsSearchCloudSingleShard extends SolrCloudTestCase {
             .filter(core -> core.getName().contains(COLLECTION))
             .findFirst()
             .orElseThrow(() -> new RuntimeException("Collection not found"))
-            .getSearcher()
-            .get();
+            .getSearcher();
     }
 
     private HashMap<Integer, int[]> createRandomDocs(int start, int numDocs) throws Exception {
